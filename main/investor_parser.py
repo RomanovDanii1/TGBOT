@@ -1,333 +1,331 @@
+import ast
 import asyncio
 import logging
+import re
+import sys
 from datetime import datetime, timedelta
+import json
+
 import requests
 from bs4 import BeautifulSoup
 import openai
-import re
 
 
-async def get_currency_current_price(url, parse_info):
+async def from_arr_to_set(arr):
+    new_arr = []
+    for el in arr:
+        new_arr.extend([el[:3], el[3:]])
+    return list(set(new_arr))
+
+async def from_arr_to_dict(arr):
+    new_dict = {}
+    for currency_pair in arr:
+        new_dict.update({
+            f"{currency_pair}": {
+                    "url": f"https://ru.investing.com/currencies/{currency_pair[:3:].lower()}-{currency_pair[3::].lower()}",
+            }
+        })
+    return new_dict
+
+async def get_currency_price_for_currencies(current_currency_dict):
+    for pair_key, pair_value in current_currency_dict.items():
+        # Викликаємо функцію, щоб розпарсити потрібні нам дані з сайту для поточної валюти.
+        # У функцію передаємо поле 'current_price_url'(посилання для парсингу) з поточного 'currency_val'(слвовник поточної валюти)
+        current_price, open_price = await parce_currency_price_for_currencies(pair_value["url"])
+        # У словник поточної валюти 'currency_val' додаємо інформацію про поточний курс та курс на момент відкриття торгів.
+        pair_value.update({
+            'current_price': current_price,
+            'open_day_price': open_price
+        })
+    return current_currency_dict
+
+
+
+async def parce_currency_price_for_currencies(url):
     response = requests.get(url)
     if response.status_code == 200:
         page_content = response.text
 
         soup = BeautifulSoup(page_content, 'html.parser')
 
-        current_current_price_div = soup.find(parse_info[0], parse_info[1])
-
-        current_current_price_value = current_current_price_div.text.strip()
-
-        return current_current_price_value
-    else:
-        return 0
-
-async def day_currency_price(currency_price_dict):
-    response = requests.get(currency_price_dict['url'])
-    if response.status_code == 200:
-        page_content = response.text
-
-        soup = BeautifulSoup(page_content, 'html.parser')
-
-        open_current_price_div = soup.find(currency_price_dict['open_current_price'][0],
-                                           currency_price_dict['open_current_price'][1])
+        open_current_price_div = soup.find("dd", {"data-test": "open"})
         open_current_price_value = open_current_price_div.text.strip()
 
-        current_current_price_div = soup.find(currency_price_dict['current_currency_price'][0],
-                                              currency_price_dict['current_currency_price'][1])
+        current_current_price_div = soup.find("span", {"data-test": "instrument-price-last"})
         current_current_price_value = current_current_price_div.text.strip()
 
-        return current_current_price_value, open_current_price_value
+        return current_current_price_value.replace(",","."), open_current_price_value.replace(",", ".")
+
+
+
+async def get_last_info_for_selected_currencies(currencies, parser_dict, message):
+    temporary_dict = {}
+    for currency in currencies:
+        period = datetime.now().date()
+        # Запускаємо нескінченний цикл, який буде перевіряти наявність подій з поточною валютою у 'period'. У разі відсутності
+        # подій 'period' змінюється на -1 день. Нескінченний цикл дозволяє робити цю перевірку стільки - скільки це буде потрібно.
+        while True:
+            payload = {
+                'country[]': [25, 4, 17, 39, 72, 26, 10, 6, 37, 43, 56, 36, 5, 61, 22, 12, 35],
+                'dateFrom': str(period),
+                'dateTo': str(period),
+                'timeZone': 18,
+                'timeFilter': 'timeRemain',
+                'currentTab': 'custom',
+                'limit_from': 0,
+            }
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://ru.investing.com/economic-calendar/',
+                'Accept': 'text/html, */*; q=0.01',
+            }
+
+            response = requests.post(parser_dict['url'], data=payload, headers=headers)
+            if response.status_code == 200:
+                json_data = response.json()
+                html_string = json_data['data']
+                soup = BeautifulSoup(html_string, 'html.parser')
+                all_events = soup.find_all(parser_dict['elements_class'][0], parser_dict['elements_class'][1])
+                # Записуємо в масив всі події, в яких:
+                # 1. Дата публікації події відповідає 'period'
+                # 2. Актуальна та попередня ціни вже відомі
+                # 3. Валюта події дорівнює поточній валюті
+                last_day_events = [event for event in all_events if
+                       datetime.strptime(event[parser_dict['datatime']],'%Y/%m/%d %H:%M:%S').date() <= period and event.find(
+                       parser_dict['actual_class'][0],class_=parser_dict['actual_class'][1]).text.strip() and event.find(
+                       parser_dict['prev_class'][0],class_=parser_dict['prev_class'][1]).text.strip() and event.find(
+                       parser_dict['event_currency_class'][0], class_=parser_dict['event_currency_class'][1]).text.strip() == currency]
+                if not last_day_events: # Якщо масив порожній, зменшуємо 'period' на -1 день і ще раз виконуємо цикл 'True'.
+                    period -= timedelta(days=1)
+                else:
+                    break
+            else:
+                await message.answer(f"Request failed with status code {response.status_code}")
+                await message.answer(response.text)
+        # Викликаємо функцію, яка розпарсить всю потрібну інформацію, яку ми отримали і записали у 'last_day_events'
+        # Передаємо аргументи: Всі події за останній день, пов'язані з поточною валютою 'last_day_events',
+        # словник для парсингу 'parser_dict', назву поточної валюти
+        last_event = await parser_for_last_currency_info(last_day_events, parser_dict, currency, message)
+
+        temporary_dict.update({
+            f"{currency}": last_event
+        })
+    return temporary_dict
+
+
+async def parser_for_last_currency_info(last_day_events, parser_dict, currency, message):
+    id_checker = [] # Створюємо масив для зберігання айді всіх події, пов'язаних з обраною валютою.
+    # Запускаємо цикл для кожної події і парсимо портібну інформацію.
+    for event in last_day_events:
+        event_id = event.get('id') # Айді події
+        event_name = event.find(parser_dict['event_class'][0],
+                                class_=parser_dict['event_class'][1]).text.strip() # Опис події
+        event_full_time = datetime.strptime(event[parser_dict['datatime']],
+                                            '%Y/%m/%d %H:%M:%S') # Повний час публікації події
+        time = event.find(parser_dict['time_class'][0],
+                          class_=parser_dict['time_class'][1]).text.strip() # Година, проведення події
+
+        event_currency = event.find(parser_dict['event_currency_class'][0],
+                                    class_=parser_dict['event_currency_class'][1]).text.strip() # Валюта події
+        actual = event.find(parser_dict['actual_class'][0],
+                            class_=parser_dict['actual_class'][1]).text.strip() # Актуальний курс події
+        actual = "N/A" if not actual else actual
+
+        forecast = event.find(parser_dict['forecast_class'][0],
+                           class_=parser_dict['forecast_class'][1]).text.strip() # Прогноз курсу події
+        forecast = "N/A" if not forecast else forecast
+
+        previous = event.find(parser_dict['prev_class'][0],
+                              class_=parser_dict['prev_class'][1]).text.strip() # попередній курс події
+        previous = "N/A" if not previous else previous
+
+        if actual == "N/A":
+            continue
+
+
+
+        id_checker.append(event_id) # Додаємо до списку айді кожної події, яка містить інформацію про 'actual'
+
+        last_event = {
+            "id": event_id,
+            "event_name": event_name,
+            "event_full_time": event_full_time,
+            "currency": event_currency,
+            "time": time,
+            "actual": actual,
+            "forecast": forecast,
+            "previous": previous,
+        }
+
+    last_event.update({"id_checker": id_checker})
+
+    return last_event
 
 
 async def start_chat_gpt(last_info):
     try:
-        openai.api_key = "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"
+        openai.api_key = "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"
 
-        prompt = (
-            f"What is the expected impact if an event happened today, and we know that {str(last_info['event_name'])} has the following data:\n"
-            f"Current exchange rate/index/event indicator: {str(last_info['actual'])}\n"
-            f"Forecast for the current exchange rate/index/event indicator: {str(last_info['forecast'])}\n"
-            f"Previous exchange rate/index/event indicator: {str(last_info['previous'])}\n"
-            f"In your opinion, by what percentage can the price of {last_info['currency']} on the foreign exchange market increase or decrease, taking into account the event's impact?\n"
-            f"Even if you predict a very small percentage change, please state it clearly, for example, (+0.03%) or (-0.03%) or (The price will remain stable)."
-            f"Take into account that it is incredibly rare for the price of a currency on the exchange to rise or fall by more than 5 percent"
-        )
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            max_tokens=150,
-            temperature=0.7,
+        currency1 = last_info['0']
+        currency2 = last_info['1']
+        message = (
+            f"I have 2 events related to specific {currency1['currency']} and {currency2['currency']}.\n"
+            f"I need you to estimate the effect of this event on the rate of {currency1['currency']}/{currency2['currency']} necessarily in percent. Your answer should be"
+            "in JSON format. For example: {{'prediction': '+0.78%'}}. If you can't determine the direction of currency movement, just reply with {{'prediction': '+0%'}}."
+            f"Information for the event associated with {currency1['currency']}:\n"
+            f"Event details: {currency1['event_name']}\n"
+            f"Actual indicator/index/rate = {str(currency1['actual'])}\n"
+            f"Previous Indicator/Index/Currency = {str(currency1['previous'])}\n"
+            f"Forecast rate/index/exchange rate = {str(currency1['forecast'])}\n"
+            f"Information for the event related to {currency2['currency']}:\n"
+            f"Event details: {currency2['event_name']}\n"
+            f"Actual indicator/index/rate = {str(currency2['actual'])}\n"
+            f"Previous Indicator/Index/Currency = {str(currency2['previous'])}\n"
+            f"Forecast indicator/index/exchange rate = {str(currency2['forecast'])}\n"
+            "Even if the change is minimal, provide your prediction, e.g., {'prediction': '-0.01%'}"
         )
 
-        answer = response.choices[0].text
-        if 'The price will remain stable' in answer:
-            answer = 0
-        return answer
+        messages = ([
+            {'role': 'system', 'content': 'You are an expert in the currency exchange'},
+            {'role': 'user', 'content': message}
+        ])
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo-1106",
+            messages=messages,
+        )
+
+        response_text = ast.literal_eval(response.choices[0].message.content)
+        response_text = response_text.get('prediction')
+        if response_text:
+            return response_text
+        else:
+            return "0%"
 
     except Exception as err:
-        logging.error(err)
+        return err
 
+async def show_day_prediction(currencies_dict, last_currencies_event_dict, message):
+    for key, val in currencies_dict.items():
+        last_event = {}
+        counter = 0
+        for event_key, event_val in last_currencies_event_dict.items():
 
-async def OpenAI_forecast(last_event_currencies, message=None):
-    for index in range(len(last_event_currencies)):
-        new_answer = await start_chat_gpt(last_event_currencies[index])
-        if message:
-            while True:
-                if new_answer is None:
-                    await message.answer("Вибачте...\n"
-                                         "Боту потрібно відпочити 1 хвилинку")
-                    await asyncio.sleep(60)
-                    new_answer = await start_chat_gpt(last_event_currencies[index])
-                else:
-                    break
-        last_event_currencies[index].update({'bot_prediction': str(new_answer)})
-    return last_event_currencies
+            if event_key in key:
+                last_event.update({
+                    "0": last_currencies_event_dict[f'{key[:3:]}'],
+                    "1": last_currencies_event_dict[f'{key[3::]}'],
+                })
+                counter += 1
 
+        currency_current_price, currency_open_price = await parce_currency_price_for_currencies(str(val['url']))
 
-async def show_last_info(last_event_currencies, message, currency_close_price_parser=None, currency1=None,
-                         currency2=None, urls=None, open_day_currencies=None, bot_prediction_currency1=None, bot_prediction_currency2=None):
-    last_event_currencies = await OpenAI_forecast(last_event_currencies, message)
-    if currency_close_price_parser:
-        close_currencies = []
-        for url in urls:
-            response = requests.get(url)
-            if response.status_code == 200:
-                page_content = response.text
+        price_prediction = await start_chat_gpt(last_event)
+        price_prediction_counter = 0
 
-                soup = BeautifulSoup(page_content, 'html.parser')
-
-                open_current_price_div = soup.find(currency_close_price_parser[0],
-                                                   currency_close_price_parser[1])
-
-                close_currencies.append(open_current_price_div.text.strip())
-
-        close_currency1 = close_currencies[0].replace(",", ".")
-        close_currency2 = close_currencies[1].replace(",", ".")
-        open_day_currency1 = open_day_currencies[0].replace(",", ".")
-        open_day_currency2 = open_day_currencies[1].replace(",", ".")
-        currency1_day_result = (float(open_day_currency1) - float(close_currency1)) / float(open_day_currency1) * 100
-        if float(close_currency1) < float(open_day_currency1):
-            currency1_day_result *= -1
-        currency2_day_result = (float(open_day_currency2) - float(close_currency2)) / float(open_day_currency2) * 100
-        if float(close_currency2) < float(open_day_currency2):
-            currency2_day_result *= -1
-        different2_percent = ((float(bot_prediction_currency2) - float(close_currency2)) / float(close_currency2)) * 100
-        different1_percent = ((float(bot_prediction_currency1) - float(close_currency1)) / float(close_currency1)) * 100
-
-        await message.answer(f"Результати закриттяn\n\n"
-                             f"Валютна пара {currency1}/{currency2}\n"
-                             f"Поточний курс: {close_currency1}\n"
-                             f"Прогноз від бота: {bot_prediction_currency1}\n"
-                             f"Різниця між прогнозом і поточним курсом: {round(different1_percent, 5)}%\n"
-                             f"Вчора ціна змінилась на {round(currency1_day_result, 5)}%\n\n\n"
-                             f"Валютна пара {currency2}/{currency1}\n"
-                             f"Поточний курс: {close_currency2}\n"
-                             f"Прогноз від бота: {bot_prediction_currency2}\n"
-                             f"Різниця між прогнозом і поточним курсом: {round(different2_percent, 5)}%\n"
-                             f"Вчора ціна змінилась на {round(currency2_day_result, 5)}%\n"
-                             )
-
-    current_currency_parser = ["span", {"data-test": "instrument-price-last"}]
-    currency_heading = []
-    for index in range(len(last_event_currencies)):
-        if index == 0:
-            url = f"https://ru.investing.com/currencies/{last_event_currencies[0]['currency'].lower()}-{last_event_currencies[1]['currency'].lower()}"
-        else:
-            url = f"https://ru.investing.com/currencies/{last_event_currencies[1]['currency'].lower()}-{last_event_currencies[0]['currency'].lower()}"
-
-        current_currency_price = await get_currency_current_price(url, current_currency_parser)
-        heading = str(last_event_currencies[index]['bot_prediction'])
-
-        match = re.search(r'-?\d+\.\d+', heading)
-        if match:
-            heading = match.group()
-        else:
-            heading = 0
-
-        current_currency_price = current_currency_price.replace(",",".")
-
-        percent = str(heading)
-        if "-" not in percent:
-            percent = f"+{percent}"
-
-        heading = float(current_currency_price) + (float(current_currency_price) / 100) * float(heading)
-        await message.answer(f"Остання подія для {str(last_event_currencies[index]['currency'])}\n"
-                             f"Дата: {str(last_event_currencies[index]['event_full_time'].date())}\n"
-                             f"Деталі: {str(last_event_currencies[index]['event_name'])}\n"
-                             f"Час: {str(last_event_currencies[index]['time'])}\n"
-                             f"Актуальне значення: {str(last_event_currencies[index]['actual'])}\n"
-                             f"Прогноз: {str(last_event_currencies[index]['forecast'])}\n"
-                             f"Попередній курс: {str(last_event_currencies[index]['previous'])}\n"
-                             f"Поточний курс валюти {current_currency_price}\n"
-                             f"Прогноз від боту: {round(float(heading), 5)} або {percent}%\n")
-        currency_heading.append(round(float(heading), 5))
-    if not currency_close_price_parser:
-        return currency_heading
-    if currency_close_price_parser:
-        return close_currency1, close_currency2
-
-
-async def get_currency_parser(dict_investor, last_day_events, message, details):
-    currency_id_checker = []
-    for tr in last_day_events:
-        event_id = tr.get('id')
-        event_name = tr.find(dict_investor['event_class'][0], class_=dict_investor['event_class'][1]).text.strip()
-        event_full_time = datetime.strptime(tr[dict_investor['datatime']], '%Y/%m/%d %H:%M:%S')
-        time = tr.find(dict_investor['time_class'][0], class_=dict_investor['time_class'][1]).text.strip()
-
-        event_currency = tr.find(dict_investor['event_currency_class'][0],
-                                 class_=dict_investor['event_currency_class'][1]).text.strip()
-        actual = tr.find(dict_investor['actual_class'][0], class_=dict_investor['actual_class'][1]).text.strip()
-        actual = "N/A" if not actual else actual
-
-        forecast = tr.find(dict_investor['forecast_class'][0],
-                           class_=dict_investor['forecast_class'][1]).text.strip()
-        forecast = "N/A" if not forecast else forecast
-
-        previous = tr.find(dict_investor['prev_class'][0], class_=dict_investor['prev_class'][1]).text.strip()
-        previous = "N/A" if not previous else previous
-
-        if actual != "N/A" and previous != "N/A":
-            actual_to_float = actual.replace(",", ".")
-            previous_to_float = previous.replace(",", ".")
-            forecast_to_float = forecast.replace(",", ".")
-            if actual_to_float.count(".") <= 1 and previous_to_float.count(".") <= 1:
-                if actual[-1] in "BKMT%" and previous[-1] in "BKMT%":
-                    actual_to_float = float(actual_to_float[:-1])
-                    previous_to_float = float(previous_to_float[:-1])
-                    if forecast_to_float != "N/A":
-                        forecast_to_float = float(forecast_to_float[:-1])
-                actual_to_float = float(actual_to_float)
-                previous_to_float = float(previous_to_float)
-                actual_to_float = float(actual_to_float)
-                previous_to_float = float(previous_to_float)
-                if forecast_to_float != "N/A":
-                    forecast_to_float = float(forecast_to_float)
-                    if previous_to_float < actual_to_float > forecast_to_float:
-                        heading = "Значне збільшення."
-                    elif previous_to_float < actual_to_float < forecast_to_float:
-                        heading = "Невелике збільшення."
-                    elif previous_to_float > actual_to_float > forecast_to_float:
-                        heading = "Невелике збільшення."
-                    elif previous_to_float > actual_to_float < forecast_to_float:
-                        heading = "Значне зменшення."
-                    elif previous_to_float < actual_to_float == forecast_to_float:
-                        heading = ("Ціна може вирости або залишитись залишитись стабільною.\n"
-                                   "Для визначення руху ціни недостатньо інформації.")
-                    elif previous_to_float > actual_to_float == forecast_to_float:
-                        heading = ("Ціна може впасти або залишитись на місці.\n"
-                                   "Для визначення руху ціни недостатньо інформації.")
-                    elif (previous_to_float == actual_to_float == forecast_to_float):
-                        heading = "Для визначення руху ціни недостатньо інформації."
-                else:
-                    if previous_to_float > actual_to_float:
-                        heading = "Зменшення."
-                    elif previous_to_float < actual_to_float:
-                        heading = "Збільшення."
-                    elif previous_to_float == actual_to_float:
-                        heading = "Ціна повинна залишитись стабільною."
-
-                currency_id_checker.append(event_id)
-
-                last_event_currency = {
-                    "id": event_id,
-                    "event_name": event_name,
-                    "event_full_time": event_full_time,
-                    "currency": event_currency,
-                    "time": time,
-                    "actual": actual,
-                    "forecast": forecast,
-                    "previous": previous,
-                    "bot_prediction": heading,
-                }
-        else:
-            heading = "Чекаємо закінчення події"
-        if details == "Yes":
-            await message.answer("\n\n"
-                                 f"Час проведення події: {event_full_time}\n"
-                                 f"Валюта: {event_currency}\n"
-                                 f"Актуальне значення: {actual}\n"
-                                 f"Прогноз значення: {forecast}\n"
-                                 f"Попереднє значення: {previous}\n"
-                                 f"Прогноз від боту: {heading}\n")
-
-    return last_event_currency, currency_id_checker
-
-
-async def get_currency_info(dict_investor, tr_elements_currency, currencies, today, message, details):
-    id_checker = []
-    for index in range(len(currencies)):
-        today = datetime.now().date()
         while True:
-            last_day_events = [tr for tr in tr_elements_currency if datetime.strptime(tr[dict_investor['datatime']],
-                                                                                      '%Y/%m/%d %H:%M:%S').date() <= today and tr.find(
-                dict_investor['actual_class'][0],
-                class_=dict_investor['actual_class'][1]).text.strip() and tr.find(dict_investor['prev_class'][0],
-                                                                                  class_=dict_investor['prev_class'][
-                                                                                      1]).text.strip() and tr.find(
-                dict_investor['event_currency_class'][0],
-                class_=dict_investor['event_currency_class'][1]).text.strip() == currencies[index]]
-            if last_day_events:
+            if str(price_prediction) == "You exceeded your current quota, please check your plan and billing details.":
+                await message.answer("We've run out of requests for the key ")
+                sys.exit()
+            elif "Rate limit" in str(price_prediction) or price_prediction is None:
+                await asyncio.sleep(60)
+                price_prediction = await start_chat_gpt(last_event)
+            elif isinstance(price_prediction, str):
                 break
-            today -= timedelta(days=1)
-        currencies[index], currency_id_checker = await get_currency_parser(dict_investor, last_day_events, message,
-                                                                           details)
-        id_checker += currency_id_checker
-    await message.answer(f"Інформація за {today}")
-    return currencies[0], currencies[1], id_checker
+            elif price_prediction_counter >= 3:
+                price_prediction = "0%"
+            price_prediction_counter += 1
 
 
-async def investing_parce_data(dict_investor, message, details):
-    global last_event_currency_1, last_event_currency_2
 
-    today = datetime.now().date()
-    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-    day_of_week = today.weekday()
-    day_name = days[day_of_week]
-    if day_name == "суббота":
-        termin = today - timedelta(days=2)
-    elif day_name in ["воскресенье", "понедельник"]:
-        termin = today - timedelta(days=4)
-    else:
-        termin = today - timedelta(days=1)
-    payload = {
-        'country[]': [25, 4, 17, 39, 72, 26, 10, 6, 37, 43, 56, 36, 5, 61, 22, 12, 35],
-        'dateFrom': str(termin),
-        'dateTo': str(today),
-        'timeZone': 18,
-        'timeFilter': 'timeRemain',
-        'currentTab': 'custom',
-        'limit_from': 0,
-    }
+        bot_prediction = await chat_gpt_get_whole_info(last_event, price_prediction)
+        bot_prediction_counter = 0
 
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': 'https://ru.investing.com/economic-calendar/',
-        'Accept': 'text/html, */*; q=0.01',
-    }
-
-    response = requests.post(dict_investor['url'], data=payload, headers=headers)
-    currencies = [dict_investor['chosen_currency1'], dict_investor['chosen_currency2']]
-    await message.answer(f"Сайт -> {dict_investor['website_name']}")
-    if response.status_code == 200:
-        json_data = response.json()
-        html_string = json_data['data']
-        soup = BeautifulSoup(html_string, 'html.parser')
-        tr_elements_currency = soup.find_all(dict_investor['elements_class'][0], dict_investor['elements_class'][1])
-
-        last_event_currency_1, last_event_currency_2, id_checker = await get_currency_info(dict_investor,
-                                                                                           tr_elements_currency,
-                                                                                           currencies, today, message,
-                                                                                           details)
-
-        last_event_currencies = [last_event_currency_1, last_event_currency_2]
+        while True:
+            if str(bot_prediction) == "You exceeded your current quota, please check your plan and billing details.":
+                await message.answer("We've run out of requests for the key ")
+                sys.exit()
+            elif "Rate limit" in str(bot_prediction) or bot_prediction is None:
+                await asyncio.sleep(60)
+                bot_prediction = await chat_gpt_get_whole_info(last_event, price_prediction)
+            elif isinstance(bot_prediction, str):
+                break
+            elif bot_prediction_counter >= 3:
+                bot_prediction = "Bullish 50%"
+                break
+            bot_prediction_counter += 1
 
 
-        currencies_heading = await show_last_info(last_event_currencies, message)
+        percent = bot_prediction.split(" ")[1]
+        if 'Bullish' in bot_prediction:
+            val.update({
+                "prediction": ["Bullish", f"▪️ <b>{key}</b> - {percent}\n"],
+            })
+        elif 'Bearish' in bot_prediction:
+            val.update({
+                "prediction": ["Bearish", f"▪️ <b>{key}</b> - {percent}\n"],
+            })
+        val.update({
+            "price_prediction": [currency_current_price, currency_open_price, price_prediction],
+            "new": 0,
+        })
 
-        return last_event_currency_1, last_event_currency_2, id_checker, currencies_heading
-    else:
-        await message.answer("err")
+
+    return currencies_dict
+
+
+
+
+async def chat_gpt_get_whole_info(last_events_dict, price_prediction, new_dict=None):
+    try:
+        openai.api_key = "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"
+        if new_dict is None:
+            event_info_1 = last_events_dict['0']
+            event_info_2 = last_events_dict['1']
+        else:
+            event_info_1 = new_dict[0]
+            event_info_2 = new_dict[1]
+        message = (
+    f"Analyze recent events for {event_info_1['currency']}/{event_info_2['currency']}.\n"
+    f"Prediction of price change for {event_info_1['currency']}/{event_info_2['currency']} from an expert: {price_prediction}\n"
+    f"{event_info_1['currency']} data:\n"
+    f"{event_info_1['currency']} event info: {event_info_1['event_name']}\n"
+    f"Fact: {event_info_1['actual']}\n"
+    f"Forecast: {event_info_1['forecast']}\n"
+    f"Previous: {event_info_1['previous']}\n"
+    f"{event_info_2['currency']} data:\n"
+    f"{event_info_2['currency']} event information: {event_info_2['event_name']}\n"
+    f"Fact: {event_info_2['actual']}\n"
+    f"Forecast: {event_info_2['forecast']}\n"
+    f"You need to predict today's close for {event_info_1['currency']}/{event_info_2['currency']} currency pair "
+    f"and choose the higher probability between bullish and bearish.\n"
+    "Your prediction must be in JSON format.\n"
+    "'sentiment' must be 'Bullish' or 'Bearish'.\n"
+    "'percentage' should be in the range of 50-70.\n"
+    "Your forecast should be very accurate and you should take"
+    " into account that if the indicators of these events do "
+    "not have a big growth, the forecast is unlikely to be more than 60%."
+    " You should also take into account the significance of each event..\n"
+    "Examples: {'prediction': 'Bullish 51.82%'}"
+)
+        messages = ([
+            {'role': 'system', 'content': 'You are an expert in the currency exchange'},
+            {'role': 'user', 'content': message}
+        ])
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo-1106",
+            messages=messages,
+        )
+
+        response_text = ast.literal_eval(response.choices[0].message.content)
+        response_text = response_text.get('prediction')
+        if response_text:
+            return response_text
+        else:
+            return "Bullish 50%"
+    except Exception as err:
+        return err
+
 
